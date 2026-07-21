@@ -81,6 +81,20 @@ function getTelegramText(message) {
   return '';
 }
 
+// 上游模型通常输出 CommonMark；Telegram 未设置 parse_mode 时会把 ** / * 原样显示。
+// 统一在 Bot API 出站层转为稳健的纯文本，避免不完整 Markdown 让 Telegram 拒绝消息。
+function normalizeTelegramOutput(text) {
+  return String(text ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/```[^\n`]*\n?([\s\S]*?)```/g, '$1')
+    .replace(/`([^`\n]+)`/g, '$1')
+    .replace(/^\s*[-+*]\s+/gm, '• ')
+    .replace(/\*\*([^*\n]+)\*\*/g, '$1')
+    .replace(/__([^_\n]+)__/g, '$1')
+    .replace(/~~([^~\n]+)~~/g, '$1')
+    .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1$2');
+}
+
 function getTelegramChatId(update) {
   return (
     update?.message?.chat?.id ??
@@ -756,7 +770,7 @@ async function callTelegramBotApi(env, fetchImpl, method, payload) {
 async function sendTelegramMessage(env, fetchImpl, chatId, text, extra = {}) {
   return callTelegramBotApi(env, fetchImpl, 'sendMessage', {
     chat_id: chatId,
-    text,
+    text: normalizeTelegramOutput(text),
     ...extra,
   });
 }
@@ -765,7 +779,7 @@ async function editTelegramMessage(env, fetchImpl, chatId, messageId, text, extr
   return callTelegramBotApi(env, fetchImpl, 'editMessageText', {
     chat_id: chatId,
     message_id: messageId,
-    text,
+    text: normalizeTelegramOutput(text),
     ...extra,
   });
 }

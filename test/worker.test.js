@@ -918,7 +918,7 @@ test('TelegramSession streams a reply and stores the turn', async () => {
   );
 });
 
-test('TelegramSession streams upstream deltas into message edits', async () => {
+test('TelegramSession renders streamed Markdown without raw asterisks', async () => {
   const calls = [];
   const storage = createStorage();
   const session = new TelegramSession(
@@ -936,11 +936,9 @@ test('TelegramSession streams upstream deltas into message edits', async () => {
           [
             'data: {"choices":[{"delta":{"role":"assistant"}}]}',
             '',
-            'data: {"choices":[{"delta":{"content":"Hel"}}]}',
+            'data: {"choices":[{"delta":{"content":"**重点**\\n* 列表"}}]}',
             '',
-            'data: {"choices":[{"delta":{"content":"lo"}}]}',
-            '',
-            'data: {"choices":[{"delta":{"content":" world"}}]}',
+            'data: {"choices":[{"delta":{"content":" 项目"}}]}',
             '',
             'data: [DONE]',
             '',
@@ -999,13 +997,13 @@ test('TelegramSession streams upstream deltas into message edits', async () => {
   assert.equal(response.status, 200);
 
   const edits = calls.filter((call) => String(call.input).endsWith('/editMessageText'));
-  assert(edits.length >= 3);
-  assert.equal(JSON.parse(edits[0].init.body).text, 'Hel');
-  assert.equal(JSON.parse(edits[1].init.body).text, 'Hello');
-  assert.equal(JSON.parse(edits.at(-1).init.body).text, 'Hello world');
+  assert(edits.length >= 2);
+  assert.equal(JSON.parse(edits[0].init.body).text, '重点\n• 列表');
+  assert.equal(JSON.parse(edits.at(-1).init.body).text, '重点\n• 列表 项目');
+  assert.equal(edits.every((call) => !JSON.parse(call.init.body).text.includes('*')), true);
 
   const stored = await storage.get('telegram-session');
-  assert.equal(stored.lastReply, 'Hello world');
+  assert.equal(stored.lastReply, '**重点**\n* 列表 项目');
   assert.deepEqual(
     stored.history.map((message) => message.role),
     ['user', 'assistant'],
