@@ -171,11 +171,15 @@ test('returns upstream OpenAI-compatible chat completions with web context injec
 
   assert.equal(response.status, 200);
   assert.equal(upstreamBodies.length, 1);
-  assert.equal(upstreamBodies[0].messages[0].role, 'system');
-  assert.match(upstreamBodies[0].messages[0].content, /网络搜索结果/);
-  assert.match(upstreamBodies[0].messages[0].content, /Cloudflare Workers Docs/);
-  assert.match(upstreamBodies[0].messages[0].content, /网页抓取内容/);
-  assert.match(upstreamBodies[0].messages[0].content, /Example Docs/);
+  const systemMessages = upstreamBodies[0].messages.filter((message) => message.role === 'system');
+  const soulMessage = systemMessages.find((message) => message.content.includes('来自 soul.md'));
+  const webMessage = systemMessages.find((message) => message.content.includes('网络搜索结果'));
+  assert(soulMessage);
+  assert.match(soulMessage.content, /幽默风趣的男高中生/);
+  assert(webMessage);
+  assert.match(webMessage.content, /Cloudflare Workers Docs/);
+  assert.match(webMessage.content, /网页抓取内容/);
+  assert.match(webMessage.content, /Example Docs/);
   assert.equal(upstreamBodies[0].messages.at(-1).role, 'user');
   assert.match(upstreamBodies[0].messages.at(-1).content, /搜索 Cloudflare Workers 文档/);
 });
@@ -724,6 +728,12 @@ test('TelegramSession injects long-term memories into upstream requests', async 
   assert.equal(upstreamBodies[0].messages[0].role, 'system');
   assert.match(upstreamBodies[0].messages[0].content, /长期记忆/);
   assert.match(upstreamBodies[0].messages[0].content, /回复时先用简体中文/);
+  assert.equal(
+    upstreamBodies[0].messages.some(
+      (message) => message.role === 'system' && message.content.includes('幽默风趣的男高中生'),
+    ),
+    true,
+  );
   assert.equal(upstreamBodies[0].messages.at(-1).role, 'user');
   assert.equal(upstreamBodies[0].messages.at(-1).content, 'ping');
 
@@ -836,11 +846,15 @@ test('TelegramSession injects web search and scrape context into upstream reques
 
   assert.equal(response.status, 200);
   assert.equal(upstreamBodies.length, 1);
-  assert.equal(upstreamBodies[0].messages[0].role, 'system');
-  assert.match(upstreamBodies[0].messages[0].content, /网络搜索结果/);
-  assert.match(upstreamBodies[0].messages[0].content, /Cloudflare Workers Docs/);
-  assert.match(upstreamBodies[0].messages[0].content, /网页抓取内容/);
-  assert.match(upstreamBodies[0].messages[0].content, /Example Docs/);
+  const systemMessages = upstreamBodies[0].messages.filter((message) => message.role === 'system');
+  const soulMessage = systemMessages.find((message) => message.content.includes('来自 soul.md'));
+  const webMessage = systemMessages.find((message) => message.content.includes('网络搜索结果'));
+  assert(soulMessage);
+  assert.match(soulMessage.content, /幽默风趣的男高中生/);
+  assert(webMessage);
+  assert.match(webMessage.content, /Cloudflare Workers Docs/);
+  assert.match(webMessage.content, /网页抓取内容/);
+  assert.match(webMessage.content, /Example Docs/);
   assert.equal(upstreamBodies[0].messages.at(-1).role, 'user');
   assert.match(upstreamBodies[0].messages.at(-1).content, /搜索 Cloudflare Workers 文档/);
 

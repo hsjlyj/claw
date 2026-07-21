@@ -3,8 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "predev": "node scripts/generate-soul.mjs",
     "dev": "npx wrangler dev",
+    "predeploy": "node scripts/generate-soul.mjs",
     "deploy": "npx wrangler deploy",
+    "pretest": "node scripts/generate-soul.mjs",
     "test": "node --test"
   }
 }

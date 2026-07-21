@@ -1,3 +1,5 @@
+import SOUL_PROMPT from './soul.js';
+
 const JSON_HEADERS = {
   'content-type': 'application/json; charset=utf-8',
 };
@@ -225,6 +227,14 @@ function buildTelegramConversationMessages(messages, memories = [], webContext =
   const memoryContext = buildTelegramMemoryContextText(memories);
   if (memoryContext) {
     contextMessages.push({ role: 'system', content: memoryContext });
+  }
+
+  const soulPrompt = String(SOUL_PROMPT || '').trim();
+  if (soulPrompt) {
+    contextMessages.push({
+      role: 'system',
+      content: `项目人格设定（来自 soul.md）：\n${soulPrompt}`,
+    });
   }
 
   const webContextText = typeof webContext === 'string' ? webContext.trim() : '';
