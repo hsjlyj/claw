@@ -1,0 +1,19 @@
+{
+  "name": "claw",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-21",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "TELEGRAM_SESSION",
+        "class_name": "TelegramSession"
+      }
+    ]
+  },
+  "exports": {
+    "TelegramSession": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}
