@@ -8,6 +8,7 @@
 - 自动网络搜索
 - 自动网页抓取
 - 隐式长期记忆
+- 网页监控、运行模式切换和摘要卡
 - 简体中文输出
 
 这个项目的目标不是做一个“花里胡哨的壳”，而是做一个**能稳定跑在 Cloudflare 免费层附近**、适合长期维护的轻量 Agent。
@@ -29,7 +30,7 @@ Telegram / OpenAI 请求
 - **Telegram 入口**
   - 支持普通消息
   - 支持 `callback_query` 按钮
-  - 支持 `/start`、`/help`、`/model`、`/reset`
+  - 支持 `/start`、`/help`、`/model`、`/reset`、`/todo`、`/remind`、`/watch`、`/mode`、`/summary`
   - 支持真正的流式回复，不是只回最终结果
 
 - **OpenAI 兼容接口**
@@ -212,6 +213,11 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 | `/help` | 显示帮助 |
 | `/model` | 查看当前模型、回复模式、流式状态 |
 | `/reset` | 清空当前短期会话，不清长期记忆 |
+| `/todo` | 管理待办事项 |
+| `/remind` | 管理定时提醒 |
+| `/watch` | 管理网页监控 |
+| `/mode` | 查看或切换运行模式 |
+| `/summary` | 查看会话摘要卡 |
 
 ### 按钮
 

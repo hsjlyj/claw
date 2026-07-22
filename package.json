@@ -3,11 +3,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "predev": "node scripts/generate-soul.mjs",
+    "generate:prompts": "node scripts/generate-claw-prompts.mjs",
+    "predev": "npm run generate:prompts",
     "dev": "npx wrangler dev",
-    "predeploy": "node scripts/generate-soul.mjs",
+    "predeploy": "npm run generate:prompts",
     "deploy": "npx wrangler deploy",
-    "pretest": "node scripts/generate-soul.mjs",
+    "pretest": "npm run generate:prompts",
     "test": "node --test"
   }
 }

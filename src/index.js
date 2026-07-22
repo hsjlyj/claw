@@ -1,4 +1,4 @@
-import SOUL_PROMPT from './soul.js';
+import { CLAW_SYSTEM_PROMPT } from './generated/claw-prompts.js';
 
 const JSON_HEADERS = {
   'content-type': 'application/json; charset=utf-8',
@@ -15,10 +15,15 @@ const TELEGRAM_API_BASE = 'https://api.telegram.org';
 const TELEGRAM_MEMORY_RECENT_LIMIT = 6;
 const TELEGRAM_MEMORY_COMPACT_THRESHOLD = 8;
 const TELEGRAM_MEMORY_SUMMARY_LIMIT = 240;
+// ponytail: one fixed polling interval keeps watch alarms simple; per-watch cadence can come later.
+const TELEGRAM_WATCH_POLL_INTERVAL_MS = 30 * 60 * 1000;
 const WEB_SEARCH_RESULT_LIMIT = 3;
 const WEB_SCRAPE_LIMIT = 2;
 const WEB_CONTEXT_LIMIT = 1800;
 const WEB_REQUEST_TIMEOUT_MS = 8000;
+const CLAW_SYSTEM_MESSAGE = CLAW_SYSTEM_PROMPT
+  ? Object.freeze({ role: 'system', content: CLAW_SYSTEM_PROMPT })
+  : null;
 
 function json(data, init = {}) {
   const headers = new Headers(init.headers ?? {});
@@ -83,20 +88,6 @@ function getTelegramText(message) {
   return '';
 }
 
-// 上游模型通常输出 CommonMark；Telegram 未设置 parse_mode 时会把 ** / * 原样显示。
-// 统一在 Bot API 出站层转为稳健的纯文本，避免不完整 Markdown 让 Telegram 拒绝消息。
-function normalizeTelegramOutput(text) {
-  return String(text ?? '')
-    .replace(/\r\n?/g, '\n')
-    .replace(/```[^\n`]*\n?([\s\S]*?)```/g, '$1')
-    .replace(/`([^`\n]+)`/g, '$1')
-    .replace(/^\s*[-+*]\s+/gm, '• ')
-    .replace(/\*\*([^*\n]+)\*\*/g, '$1')
-    .replace(/__([^_\n]+)__/g, '$1')
-    .replace(/~~([^~\n]+)~~/g, '$1')
-    .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1$2');
-}
-
 function getTelegramChatId(update) {
   return (
     update?.message?.chat?.id ??
@@ -121,6 +112,388 @@ function parseTelegramCommand(text) {
   return firstToken.slice(1).split('@')[0].toLowerCase();
 }
 
+// Telegram 命令先集中登记，再由 help 面板和路由层一起读取。
+// 公开命令会显示在 /help 里，隐藏命令只保留路由入口，不对用户展开。
+const TELEGRAM_COMMAND_SPECS = Object.freeze([
+  { command: 'start', description: '显示此帮助', kind: 'help' },
+  { command: 'help', description: '显示此帮助', kind: 'help' },
+  { command: 'model', description: '查看当前模型', kind: 'model' },
+  { command: 'reset', description: '清空当前会话', kind: 'reset' },
+  { command: 'todo', description: '管理待办事项', kind: 'pending' },
+  { command: 'remind', description: '管理提醒任务', kind: 'pending' },
+  { command: 'watch', description: '管理网页监控', kind: 'pending' },
+  { command: 'mode', description: '查看或切换运行模式', kind: 'pending' },
+  { command: 'summary', description: '查看或压缩近期摘要', kind: 'pending' },
+  { command: 'remember', description: '记住一条长期记忆', kind: 'hidden' },
+  { command: 'memories', description: '查看长期记忆列表', kind: 'hidden' },
+  { command: 'forget', description: '删除长期记忆', kind: 'hidden' },
+]);
+const TELEGRAM_PUBLIC_COMMAND_SPECS = TELEGRAM_COMMAND_SPECS.filter((spec) => spec.kind !== 'hidden');
+
+function buildTelegramPendingCommandText(command) {
+  return `/${command} 命令已接入路由，功能还在接入中。输入 /help 查看可用命令。`;
+}
+
+function buildTelegramUnsupportedCommandText(command) {
+  return `暂不支持 /${command}。输入 /help 查看可用命令。`;
+}
+
+const TELEGRAM_MODE_SPECS = Object.freeze([
+  { mode: 'normal', label: '正常', description: '默认模式，平衡简洁和细节' },
+  { mode: 'brief', label: '简洁', description: '尽量短，先给结论' },
+  { mode: 'detailed', label: '详细', description: '回答更完整一些' },
+  { mode: 'playful', label: '轻松', description: '语气更活泼一点' },
+]);
+
+function normalizeTelegramMode(mode) {
+  const value = normalizeTelegramMemoryText(mode).toLowerCase();
+  if (!value) return 'normal';
+
+  if (value === 'normal' || value === 'default' || value === '默认' || value === '正常' || value === '普通') {
+    return 'normal';
+  }
+
+  if (value === 'brief' || value === 'compact' || value === 'short' || value === '简洁' || value === '简短' || value === '精简') {
+    return 'brief';
+  }
+
+  if (value === 'detailed' || value === 'detail' || value === 'long' || value === '详细' || value === '展开') {
+    return 'detailed';
+  }
+
+  if (value === 'playful' || value === 'fun' || value === 'light' || value === '轻松' || value === '活泼' || value === '幽默') {
+    return 'playful';
+  }
+
+  return '';
+}
+
+function buildTelegramModeDisplayName(mode) {
+  const normalized = normalizeTelegramMode(mode);
+  return TELEGRAM_MODE_SPECS.find((spec) => spec.mode === normalized)?.label || '正常';
+}
+
+function buildTelegramModeContextText(mode) {
+  switch (normalizeTelegramMode(mode)) {
+    case 'brief':
+      return '当前对话模式：简洁。回答要短、直，先给结论，再补必要理由。';
+    case 'detailed':
+      return '当前对话模式：详细。回答可以更完整，分点说明，但不要灌水。';
+    case 'playful':
+      return '当前对话模式：轻松。语气可以更活泼一点，允许少量吐槽，但技术结论要准确。';
+    default:
+      return '';
+  }
+}
+
+function buildTelegramModeListText(currentMode = 'normal') {
+  const normalized = normalizeTelegramMode(currentMode) || 'normal';
+  const lines = [
+    `当前模式：${buildTelegramModeDisplayName(normalized)}（${normalized}）`,
+    '',
+    '可用模式：',
+  ];
+
+  TELEGRAM_MODE_SPECS.forEach((spec, index) => {
+    lines.push(`${index + 1}. ${spec.label}（${spec.mode}）- ${spec.description}`);
+  });
+
+  lines.push(
+    '',
+    '命令：',
+    '/mode - 查看当前模式',
+    '/mode brief - 切换到简洁模式',
+    '/mode detailed - 切换到详细模式',
+    '/mode playful - 切换到轻松模式',
+    '/mode normal - 切换回默认模式',
+  );
+
+  return lines.join('\n');
+}
+
+function buildTelegramModeUnavailableText() {
+  return '当前还没有启用模式存储。请配置 TELEGRAM_SESSION 后再使用 /mode。';
+}
+
+function buildTelegramModeChangedText(mode) {
+  return `已切换到${buildTelegramModeDisplayName(mode)}模式。`;
+}
+
+function buildTelegramSummaryUnavailableText() {
+  return '当前还没有启用摘要存储。请配置 TELEGRAM_SESSION 后再使用 /summary。';
+}
+
+function buildTelegramConversationPreviewText(history = [], limit = 4) {
+  const items = Array.isArray(history) ? history.slice(-limit) : [];
+  if (items.length === 0) {
+    return '近期对话：暂无。';
+  }
+
+  return [
+    '近期对话：',
+    ...items.map((message) => {
+      const role = message?.role === 'assistant' ? 'claw' : message?.role === 'user' ? '你' : String(message?.role || '系统');
+      const text = truncateContextText(normalizeTelegramDisplayText(getMessageText(message)), 120);
+      return `- ${role}：${text}`;
+    }),
+  ].join('\n');
+}
+
+function buildTelegramSummaryCardText(session = {}) {
+  const mode = buildTelegramModeDisplayName(session?.mode);
+  const memorySummary = buildTelegramMemorySummaryText(Array.isArray(session?.memories) ? session.memories : [])
+    .replace(/^历史摘要：\s*/u, '')
+    .trim();
+  const preview = buildTelegramConversationPreviewText(Array.isArray(session?.history) ? session.history : []);
+  const lines = [
+    '会话摘要卡：',
+    `当前模式：${mode}`,
+    preview,
+    `长期记忆：${memorySummary || '暂无可压缩内容'}`,
+  ];
+
+  return lines.join('\n');
+}
+
+function buildTelegramSummaryContextText(session = {}) {
+  const history = Array.isArray(session?.history) ? session.history : [];
+  if (history.length <= 4) return '';
+  const preview = buildTelegramConversationPreviewText(history);
+  return `会话摘要（仅供参考，优先级低于用户当前消息）：\n${preview}`;
+}
+
+function normalizeTelegramSummaryText(text) {
+  return normalizeTelegramMemoryText(text);
+}
+
+async function handleTelegramSlashCommand({ command, commandText = '', session, env, fetchImpl, chatId, replyMarkup }) {
+  if (!command) return false;
+
+  // 先把斜杠命令拦下来，再决定是回帮助、回模型信息，还是返回占位提示。
+  // 这样 /foo 不会误入普通聊天分支，更不会被当成自然语言发给模型。
+  switch (command) {
+    case 'start':
+    case 'help':
+      await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramHelpText(), replyMarkup);
+      return true;
+    case 'model':
+      await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramModelText(env), replyMarkup);
+      return true;
+    case 'reset':
+      if (session) {
+        await resetTelegramConversation(session);
+      }
+      await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramResetText(), replyMarkup);
+      return true;
+    case 'todo':
+      return handleTelegramTodoCommand({
+        commandText,
+        session,
+        env,
+        fetchImpl,
+        chatId,
+        replyMarkup,
+      });
+    case 'remind':
+      return handleTelegramRemindCommand({
+        commandText,
+        session,
+        env,
+        fetchImpl,
+        chatId,
+        replyMarkup,
+      });
+    case 'watch':
+      return handleTelegramWatchCommand({
+        commandText,
+        session,
+        env,
+        fetchImpl,
+        chatId,
+        replyMarkup,
+      });
+    case 'mode':
+      return handleTelegramModeCommand({
+        commandText,
+        session,
+        env,
+        fetchImpl,
+        chatId,
+        replyMarkup,
+      });
+    case 'summary':
+      return handleTelegramSummaryCommand({
+        commandText,
+        session,
+        env,
+        fetchImpl,
+        chatId,
+        replyMarkup,
+      });
+    default:
+      await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramUnsupportedCommandText(command), replyMarkup);
+      return true;
+  }
+}
+
+async function handleTelegramTodoCommand({ commandText, session, env, fetchImpl, chatId, replyMarkup }) {
+  if (!session) {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramTodoUnavailableText(), replyMarkup);
+    return true;
+  }
+
+  const todos = compactTelegramTodos(Array.isArray(session.todos) ? session.todos : []);
+  const argsText = normalizeTelegramTodoText(getTelegramCommandArgs(commandText));
+
+  if (!argsText) {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramTodoListText(todos), replyMarkup);
+    return true;
+  }
+
+  const [actionToken, ...restTokens] = argsText.split(/\s+/);
+  const action = actionToken.toLowerCase();
+  const valueText = normalizeTelegramTodoText(restTokens.join(' '));
+
+  if (action === 'list' || action === 'ls' || action === 'show' || action === 'help') {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramTodoListText(todos), replyMarkup);
+    return true;
+  }
+
+  if (action === 'add' || action === 'new' || action === 'create') {
+    if (!valueText) {
+      await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramTodoMissingText(), replyMarkup);
+      return true;
+    }
+
+    session.todos = [...todos, valueText];
+    await saveTelegramSession(session.storage, session);
+    await sendTelegramMessage(env, fetchImpl, chatId, `已添加待办：${valueText}`, replyMarkup);
+    return true;
+  }
+
+  if (action === 'clear' || action === 'empty') {
+    session.todos = [];
+    await saveTelegramSession(session.storage, session);
+    await sendTelegramMessage(env, fetchImpl, chatId, '待办已清空。', replyMarkup);
+    return true;
+  }
+
+  if (action === 'done' || action === 'finish' || action === 'complete') {
+    if (!valueText) {
+      await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramTodoMissingText(), replyMarkup);
+      return true;
+    }
+
+    const index = resolveTelegramTodoIndex(todos, valueText);
+    if (index === -1) {
+      await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramTodoNotFoundText(), replyMarkup);
+      return true;
+    }
+
+    const [removed] = todos.splice(index, 1);
+    session.todos = todos;
+    await saveTelegramSession(session.storage, session);
+    await sendTelegramMessage(env, fetchImpl, chatId, `已完成待办：${removed}`, replyMarkup);
+    return true;
+  }
+
+  if (action === 'del' || action === 'delete' || action === 'remove' || action === 'rm') {
+    if (!valueText) {
+      await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramTodoMissingText(), replyMarkup);
+      return true;
+    }
+
+    const index = resolveTelegramTodoIndex(todos, valueText);
+    if (index === -1) {
+      await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramTodoNotFoundText(), replyMarkup);
+      return true;
+    }
+
+    const [removed] = todos.splice(index, 1);
+    session.todos = todos;
+    await saveTelegramSession(session.storage, session);
+    await sendTelegramMessage(env, fetchImpl, chatId, `已删除待办：${removed}`, replyMarkup);
+    return true;
+  }
+
+  const todoText = normalizeTelegramTodoText(argsText);
+  if (!todoText) {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramTodoMissingText(), replyMarkup);
+    return true;
+  }
+
+  session.todos = [...todos, todoText];
+  await saveTelegramSession(session.storage, session);
+  await sendTelegramMessage(env, fetchImpl, chatId, `已添加待办：${todoText}`, replyMarkup);
+  return true;
+}
+
+async function handleTelegramRemindCommand({ commandText, session, env, fetchImpl, chatId, replyMarkup }) {
+  if (!session) {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramReminderUnavailableText(), replyMarkup);
+    return true;
+  }
+
+  session.chatId = chatId;
+  const reminders = compactTelegramReminders(Array.isArray(session.reminders) ? session.reminders : []);
+  const argsText = normalizeTelegramReminderText(getTelegramCommandArgs(commandText));
+
+  if (!argsText) {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramRemindListText(reminders), replyMarkup);
+    return true;
+  }
+
+  const [actionToken, ...restTokens] = argsText.split(/\s+/);
+  const action = actionToken.toLowerCase();
+  const valueText = normalizeTelegramReminderText(restTokens.join(' '));
+
+  if (action === 'list' || action === 'ls' || action === 'show' || action === 'help') {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramRemindListText(reminders), replyMarkup);
+    return true;
+  }
+
+  if (action === 'clear' || action === 'empty') {
+    session.reminders = [];
+    await saveTelegramSession(session.storage, session);
+    await scheduleTelegramReminderAlarm(session);
+    await sendTelegramMessage(env, fetchImpl, chatId, '提醒已清空。', replyMarkup);
+    return true;
+  }
+
+  if (action === 'done' || action === 'finish' || action === 'complete' || action === 'del' || action === 'delete' || action === 'remove' || action === 'rm' || action === 'cancel') {
+    if (!valueText) {
+      await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramReminderMissingText(), replyMarkup);
+      return true;
+    }
+
+    const index = resolveTelegramReminderIndex(reminders, valueText);
+    if (index === -1) {
+      await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramReminderNotFoundText(), replyMarkup);
+      return true;
+    }
+
+    const [removed] = reminders.splice(index, 1);
+    session.reminders = reminders;
+    await saveTelegramSession(session.storage, session);
+    await scheduleTelegramReminderAlarm(session);
+    await sendTelegramMessage(env, fetchImpl, chatId, `已取消提醒：${removed.text}`, replyMarkup);
+    return true;
+  }
+
+  const spec = buildTelegramReminderSpecFromArgs(action, valueText || restTokens.join(' '));
+  if (!spec) {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramReminderMissingText(), replyMarkup);
+    return true;
+  }
+
+  const reminder = createTelegramReminder(spec.reminderText, Date.now() + spec.delayMs);
+  session.reminders = [...reminders, reminder];
+  await saveTelegramSession(session.storage, session);
+  await scheduleTelegramReminderAlarm(session);
+  await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramReminderAddedText(reminder), replyMarkup);
+  return true;
+}
+
 // Telegram 的按钮交互只走 callback_query，不会额外发一条普通文本消息。
 // 下面这组按钮统一复用：Retry 重新生成上一轮，Reset 清空会话，Help 打开帮助面板。
 // 对应的 Telegram Bot API 细节：
@@ -142,19 +515,24 @@ function buildTelegramReplyMarkup() {
 function buildTelegramHelpText() {
   // /start 和 /help 返回同一份说明，目的不是“讲故事”，而是让用户
   // 一眼知道有哪些命令、按钮各自负责什么，以及下一步该点哪里。
-  return [
+  const lines = [
     '发送消息，我会在当前对话里回复。',
     '',
     '命令：',
-    '/start - 显示此帮助',
-    '/help - 显示此帮助',
-    '/model - 查看当前模型',
-    '/reset - 清空当前会话',
+  ];
+
+  for (const spec of TELEGRAM_PUBLIC_COMMAND_SPECS) {
+    lines.push(`/${spec.command} - ${spec.description}`);
+  }
+
+  lines.push(
     '',
     '按钮：',
     '重试 - 重新生成上一条回复',
     '重置 - 清空当前会话',
-  ].join('\n');
+  );
+
+  return lines.join('\n');
 }
 
 function buildTelegramModelText(env) {
@@ -178,6 +556,73 @@ function buildTelegramResetText() {
 function buildTelegramThinkingText() {
   // 先发“思考中”，再把模型输出逐段编辑进同一条消息。
   return '思考中...';
+}
+
+// 主动跟进只做轻量的一句，不抢主回复的戏。
+// 规则很克制：只有用户明显在提需求、而且回复里还没自己带出“要不要/如果你想”这类跟进语气时才发送。
+const TELEGRAM_PROACTIVE_FOLLOW_UP_RULES = Object.freeze([
+  {
+    patterns: [/readme/iu, /说明文档/iu, /文档结构/iu],
+    followUp: '要不要我顺手帮你补一版 README 结构？',
+  },
+  {
+    patterns: [/部署/iu, /上线/iu, /worker/iu, /wrangler/iu, /cloudflare/iu],
+    followUp: '要不要我顺手帮你列一份部署清单？',
+  },
+  {
+    patterns: [/长期记忆/iu, /记忆/iu, /memory/iu],
+    followUp: '要不要我顺手把长期记忆流程也补上？',
+  },
+  {
+    patterns: [/telegram/iu, /机器人/iu, /webhook/iu, /回调/iu, /按钮/iu],
+    followUp: '要不要我顺手把 Telegram 交互也补完整？',
+  },
+  {
+    patterns: [/搜索/iu, /抓取/iu, /scrape/iu, /crawl/iu, /网页/iu],
+    followUp: '要不要我顺手把搜索和抓取的入口也串起来？',
+  },
+  {
+    patterns: [/todo/iu, /待办/iu, /提醒/iu, /watch/iu, /监控/iu],
+    followUp: '要不要我顺手把这块的命令也整理成一套？',
+  },
+]);
+
+const TELEGRAM_PROACTIVE_FOLLOW_UP_PROMPT_PATTERN = /(?:帮我|请|麻烦|写|生成|实现|修复|优化|补|整理|总结|分析|翻译|设计|部署|做|列出|改|接入|加上|支持|排查|调试|看看)/iu;
+const TELEGRAM_PROACTIVE_FOLLOW_UP_REPLY_PATTERN = /(?:要不要|如果你想|需要的话|如果需要|要是你想|我也可以|我还能|还要我|需要我)/iu;
+
+function buildTelegramProactiveFollowUpText(prompt, replyText) {
+  const normalizedPrompt = normalizeTelegramDisplayText(prompt);
+  if (!normalizedPrompt || !TELEGRAM_PROACTIVE_FOLLOW_UP_PROMPT_PATTERN.test(normalizedPrompt)) {
+    return '';
+  }
+
+  const normalizedReply = normalizeTelegramDisplayText(replyText);
+  if (normalizedReply && TELEGRAM_PROACTIVE_FOLLOW_UP_REPLY_PATTERN.test(normalizedReply)) {
+    return '';
+  }
+
+  for (const rule of TELEGRAM_PROACTIVE_FOLLOW_UP_RULES) {
+    if (rule.patterns.some((pattern) => pattern.test(normalizedPrompt))) {
+      return rule.followUp;
+    }
+  }
+
+  return '要不要我顺手把下一步拆成清单？';
+}
+
+async function sendTelegramProactiveFollowUp({ env, fetchImpl, chatId, prompt, replyText }) {
+  const followUpText = buildTelegramProactiveFollowUpText(prompt, replyText);
+  if (!followUpText) {
+    return false;
+  }
+
+  try {
+    await sendTelegramMessage(env, fetchImpl, chatId, followUpText);
+    return true;
+  } catch (error) {
+    console.error('Telegram proactive follow-up failed', error);
+    return false;
+  }
 }
 
 function buildTelegramMemorySavedText(memory) {
@@ -221,20 +666,745 @@ function buildTelegramMemoryContextText(memories = []) {
   ].join('\n');
 }
 
-function buildTelegramConversationMessages(messages, memories = [], webContext = '') {
+function normalizeTelegramTodoText(text) {
+  return normalizeTelegramMemoryText(text)
+    .replace(/^[:：\s-]+/, '')
+    .replace(/[。！？!?]+$/u, '')
+    .trim();
+}
+
+function compactTelegramTodos(todos = []) {
+  if (!Array.isArray(todos) || todos.length === 0) {
+    return [];
+  }
+
+  return todos
+    .map((todo) => normalizeTelegramTodoText(todo))
+    .filter(Boolean);
+}
+
+function resolveTelegramTodoIndex(todos, rawTarget) {
+  if (!Array.isArray(todos) || todos.length === 0) return -1;
+
+  const target = normalizeTelegramTodoText(rawTarget);
+  if (!target) return -1;
+
+  const numeric = Number.parseInt(target, 10);
+  if (Number.isInteger(numeric) && String(numeric) === target) {
+    const index = numeric - 1;
+    return index >= 0 && index < todos.length ? index : -1;
+  }
+
+  const lowerTarget = target.toLowerCase();
+  return todos.findIndex((todo) => todo.toLowerCase().includes(lowerTarget));
+}
+
+function buildTelegramTodoListText(todos = []) {
+  const items = compactTelegramTodos(todos);
+  const lines = [];
+
+  if (items.length === 0) {
+    lines.push('当前没有待办。');
+  } else {
+    lines.push('当前待办：');
+    items.forEach((todo, index) => {
+      lines.push(`${index + 1}. ${truncateContextText(todo, 120)}`);
+    });
+  }
+
+  lines.push(
+    '',
+    '命令：',
+    '/todo - 查看当前待办',
+    '/todo add 内容 - 添加待办',
+    '/todo done 编号或关键词 - 标记完成并删除',
+    '/todo del 编号或关键词 - 删除待办',
+    '/todo clear - 清空全部待办',
+  );
+
+  return lines.join('\n');
+}
+
+function buildTelegramTodoUnavailableText() {
+  return '当前还没有启用待办存储。请配置 TELEGRAM_SESSION 后再使用 /todo。';
+}
+
+function buildTelegramTodoMissingText() {
+  return '请在 /todo 后面补充待办内容。';
+}
+
+function buildTelegramTodoNotFoundText() {
+  return '没有找到要处理的待办。';
+}
+
+function normalizeTelegramReminderText(text) {
+  return normalizeTelegramMemoryText(text);
+}
+
+function compactTelegramReminders(reminders = []) {
+  if (!Array.isArray(reminders) || reminders.length === 0) {
+    return [];
+  }
+
+  return reminders
+    .map((reminder) => ({
+      id: typeof reminder?.id === 'string' && reminder.id ? reminder.id : crypto.randomUUID(),
+      text: normalizeTelegramReminderText(reminder?.text),
+      dueAt: Number(reminder?.dueAt),
+      createdAt: Number(reminder?.createdAt) || Date.now(),
+    }))
+    .filter((reminder) => reminder.text && Number.isFinite(reminder.dueAt))
+    .sort((a, b) => a.dueAt - b.dueAt || a.createdAt - b.createdAt);
+}
+
+function createTelegramReminder(text, dueAt) {
+  return {
+    id: crypto.randomUUID(),
+    text: normalizeTelegramReminderText(text),
+    dueAt,
+    createdAt: Date.now(),
+  };
+}
+
+function parseTelegramDurationMs(text) {
+  const normalized = String(text || '').trim().replace(/\s+/g, '').toLowerCase();
+  if (!normalized) return null;
+
+  const pattern = /(\d+)(分钟|小时|天|日|时|分|秒|d|h|m|s)/gi;
+  let total = 0;
+  let matched = '';
+  let match;
+
+  while ((match = pattern.exec(normalized))) {
+    const amount = Number.parseInt(match[1], 10);
+    if (!Number.isFinite(amount)) return null;
+
+    const unit = match[2].toLowerCase();
+    const factor =
+      unit === '天' || unit === '日' || unit === 'd'
+        ? 24 * 60 * 60 * 1000
+        : unit === '小时' || unit === '时' || unit === 'h'
+          ? 60 * 60 * 1000
+          : unit === '分钟' || unit === '分' || unit === 'm'
+            ? 60 * 1000
+            : 1000;
+
+    total += amount * factor;
+    matched += match[0].toLowerCase();
+  }
+
+  if (matched !== normalized) return null;
+  return total;
+}
+
+function formatTelegramReminderDelayText(ms) {
+  const totalSeconds = Math.max(0, Math.floor(Number(ms) / 1000));
+  if (!totalSeconds) return '立即';
+
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const parts = [];
+
+  if (days) parts.push(`${days}天`);
+  if (hours) parts.push(`${hours}小时`);
+  if (minutes) parts.push(`${minutes}分钟`);
+  if (seconds && parts.length === 0) parts.push(`${seconds}秒`);
+
+  return `${parts.join('')}后`;
+}
+
+function resolveTelegramReminderIndex(reminders, rawTarget) {
+  if (!Array.isArray(reminders) || reminders.length === 0) return -1;
+
+  const target = normalizeTelegramReminderText(rawTarget);
+  if (!target) return -1;
+
+  const numeric = Number.parseInt(target, 10);
+  if (Number.isInteger(numeric) && String(numeric) === target) {
+    const index = numeric - 1;
+    return index >= 0 && index < reminders.length ? index : -1;
+  }
+
+  const lowerTarget = target.toLowerCase();
+  return reminders.findIndex((reminder) => reminder.text.toLowerCase().includes(lowerTarget));
+}
+
+function buildTelegramRemindListText(reminders = []) {
+  const items = compactTelegramReminders(reminders);
+  const lines = [];
+
+  if (items.length === 0) {
+    lines.push('当前没有提醒。');
+  } else {
+    lines.push('当前提醒：');
+    items.forEach((reminder, index) => {
+      lines.push(`${index + 1}. [${formatTelegramReminderDelayText(reminder.dueAt - Date.now())}] ${truncateContextText(reminder.text, 120)}`);
+    });
+  }
+
+  lines.push(
+    '',
+    '命令：',
+    '/remind - 查看当前提醒',
+    '/remind add 10m 喝水 - 添加提醒',
+    '/remind done 1 - 取消提醒',
+    '/remind del 1 - 删除提醒',
+    '/remind clear - 清空提醒',
+  );
+
+  return lines.join('\n');
+}
+
+function buildTelegramReminderUnavailableText() {
+  return '当前还没有启用提醒存储。请配置 TELEGRAM_SESSION 后再使用 /remind。';
+}
+
+function buildTelegramReminderMissingText() {
+  return '请用 /remind add 10m 喝水 这样的格式。';
+}
+
+function buildTelegramReminderNotFoundText() {
+  return '没有找到要处理的提醒。';
+}
+
+function buildTelegramReminderAddedText(reminder) {
+  return `已添加提醒：${formatTelegramReminderDelayText(reminder.dueAt - Date.now())} · ${reminder.text}`;
+}
+
+function buildTelegramReminderFiredText(reminder) {
+  return `⏰ 提醒：${reminder.text}`;
+}
+
+function parseTelegramReminderAddSpec(text) {
+  const valueText = normalizeTelegramReminderText(text);
+  if (!valueText) return null;
+
+  const [delayText, ...reminderTokens] = valueText.split(/\s+/);
+  const delayMs = parseTelegramDurationMs(delayText);
+  const reminderText = normalizeTelegramReminderText(reminderTokens.join(' '));
+
+  if (delayMs === null || !reminderText) return null;
+  return { delayMs, reminderText };
+}
+
+function buildTelegramReminderSpecFromArgs(action, valueText) {
+  if (action === 'add' || action === 'new' || action === 'create') {
+    return parseTelegramReminderAddSpec(valueText);
+  }
+
+  const delayMs = parseTelegramDurationMs(action);
+  if (delayMs === null) return null;
+
+  const reminderText = normalizeTelegramReminderText(valueText);
+  if (!reminderText) return null;
+  return { delayMs, reminderText };
+}
+
+function normalizeTelegramWatchText(text) {
+  return normalizeTelegramMemoryText(text)
+    .replace(/^[:：\s-]+/, '')
+    .replace(/[。！？!?]+$/u, '')
+    .trim();
+}
+
+function normalizeTelegramWatchUrl(rawUrl) {
+  const normalized = normalizeTelegramMemoryText(rawUrl);
+  if (!normalized) return '';
+
+  try {
+    const url = new URL(normalized);
+    if (!/^https?:$/i.test(url.protocol)) return '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return '';
+  }
+}
+
+function buildTelegramWatchDisplayName(watch = {}) {
+  const label = normalizeTelegramWatchText(watch?.label);
+  if (label) return label;
+
+  const title = normalizeTelegramWatchText(watch?.title);
+  if (title) return title;
+
+  try {
+    return new URL(watch?.url).hostname;
+  } catch {
+    return normalizeTelegramWatchText(watch?.url) || '网页监控';
+  }
+}
+
+function compactTelegramWatches(watches = []) {
+  if (!Array.isArray(watches) || watches.length === 0) {
+    return [];
+  }
+
+  const items = [];
+  const seen = new Set();
+
+  for (const watch of watches) {
+    const url = normalizeTelegramWatchUrl(watch?.url);
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+
+    const nextCheckAt = Number(watch?.nextCheckAt);
+    const createdAt = Number(watch?.createdAt);
+    const lastCheckedAt = Number(watch?.lastCheckedAt);
+    const lastNotifiedAt = Number(watch?.lastNotifiedAt);
+
+    items.push({
+      id: typeof watch?.id === 'string' && watch.id ? watch.id : crypto.randomUUID(),
+      url,
+      label: normalizeTelegramWatchText(watch?.label),
+      title: normalizeTelegramWatchText(watch?.title),
+      contentHash: typeof watch?.contentHash === 'string' ? watch.contentHash : '',
+      nextCheckAt: Number.isFinite(nextCheckAt) ? nextCheckAt : Date.now(),
+      createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
+      lastCheckedAt: Number.isFinite(lastCheckedAt) ? lastCheckedAt : 0,
+      lastNotifiedAt: Number.isFinite(lastNotifiedAt) ? lastNotifiedAt : 0,
+    });
+  }
+
+  return items.sort((a, b) => a.nextCheckAt - b.nextCheckAt || a.createdAt - b.createdAt);
+}
+
+function resolveTelegramWatchIndex(watches, rawTarget) {
+  if (!Array.isArray(watches) || watches.length === 0) return -1;
+
+  const target = normalizeTelegramWatchText(rawTarget);
+  if (!target) return -1;
+
+  const numeric = Number.parseInt(target, 10);
+  if (Number.isInteger(numeric) && String(numeric) === target) {
+    const index = numeric - 1;
+    return index >= 0 && index < watches.length ? index : -1;
+  }
+
+  const lowerTarget = target.toLowerCase();
+  return watches.findIndex((watch) => {
+    const haystacks = [watch?.label, watch?.title, watch?.url];
+    return haystacks.some((value) => normalizeTelegramWatchText(value).toLowerCase().includes(lowerTarget));
+  });
+}
+
+function buildTelegramWatchListText(watches = []) {
+  const items = compactTelegramWatches(watches);
+  const lines = [];
+
+  if (items.length === 0) {
+    lines.push('当前没有网页监控。');
+  } else {
+    lines.push('当前网页监控：');
+    items.forEach((watch, index) => {
+      const name = truncateContextText(buildTelegramWatchDisplayName(watch), 120);
+      const nextCheckText = formatTelegramReminderDelayText(Math.max(0, Number(watch.nextCheckAt) - Date.now()));
+      lines.push(`${index + 1}. ${name}`);
+      lines.push(`   ${truncateContextText(watch.url, 240)}`);
+      lines.push(`   下次检查：${nextCheckText}`);
+      if (!watch.contentHash) {
+        lines.push('   状态：等待首次抓取');
+      }
+    });
+  }
+
+  lines.push(
+    '',
+    '命令：',
+    '/watch - 查看当前网页监控',
+    '/watch add URL - 添加网页监控',
+    '/watch del 编号或关键词 - 删除网页监控',
+    '/watch clear - 清空全部网页监控',
+  );
+
+  return lines.join('\n');
+}
+
+function buildTelegramWatchUnavailableText() {
+  return '当前还没有启用网页监控存储。请配置 TELEGRAM_SESSION 后再使用 /watch。';
+}
+
+function buildTelegramWatchMissingText() {
+  return '请在 /watch 后面补充网页 URL、编号或关键词。';
+}
+
+function buildTelegramWatchNotFoundText() {
+  return '没有找到要处理的网页监控。';
+}
+
+function buildTelegramWatchAddedText(watch, hasBaseline = false) {
+  const name = buildTelegramWatchDisplayName(watch);
+  const lines = [
+    `已添加网页监控：${name}`,
+    watch.url,
+  ];
+
+  if (hasBaseline) {
+    lines.push(`首次检查：${formatTelegramReminderDelayText(Math.max(0, Number(watch.nextCheckAt) - Date.now()))}`);
+  } else {
+    lines.push('首次抓取失败，稍后重试。');
+  }
+
+  return lines.join('\n');
+}
+
+function buildTelegramWatchChangedText(watch, page) {
+  const name = buildTelegramWatchDisplayName({ ...watch, title: page?.title || watch?.title });
+  const lines = [
+    `网页已变化：${name}`,
+    watch.url,
+  ];
+
+  const summary = truncateContextText(page?.text || '', 240);
+  if (summary) {
+    lines.push(`新内容摘要：${summary}`);
+  } else {
+    lines.push('已检测到更新，但正文抓取为空。');
+  }
+
+  return lines.join('\n');
+}
+
+async function hashTelegramWatchContent(page) {
+  const text = normalizeTelegramMemoryText(`${page?.title || ''}\n${page?.text || ''}`);
+  if (!text) return '';
+
+  const buffer = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest('SHA-256', buffer);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function parseTelegramWatchAddSpec(text) {
+  const valueText = normalizeTelegramWatchText(text);
+  if (!valueText) return null;
+
+  const urls = extractUrlsFromText(valueText);
+  if (urls.length === 0) return null;
+
+  const url = normalizeTelegramWatchUrl(urls[0]);
+  if (!url) return null;
+
+  const label = normalizeTelegramWatchText(valueText.replace(urls[0], ''));
+  return { url, label };
+}
+
+function createTelegramWatch(url, label = '') {
+  const now = Date.now();
+  return {
+    id: crypto.randomUUID(),
+    url: normalizeTelegramWatchUrl(url),
+    label: normalizeTelegramWatchText(label),
+    title: '',
+    contentHash: '',
+    nextCheckAt: now + TELEGRAM_WATCH_POLL_INTERVAL_MS,
+    createdAt: now,
+    lastCheckedAt: 0,
+    lastNotifiedAt: 0,
+  };
+}
+
+async function scheduleTelegramReminderAlarm(session) {
+  const storage = session?.storage;
+  if (!storage) return;
+
+  const reminders = compactTelegramReminders(Array.isArray(session?.reminders) ? session.reminders : []);
+  const watches = compactTelegramWatches(Array.isArray(session?.watches) ? session.watches : []);
+  session.reminders = reminders;
+  session.watches = watches;
+
+  const nextDueTimes = [];
+  if (reminders.length > 0) {
+    nextDueTimes.push(reminders[0].dueAt);
+  }
+  if (watches.length > 0) {
+    nextDueTimes.push(watches[0].nextCheckAt);
+  }
+
+  if (nextDueTimes.length === 0) {
+    if (typeof storage.deleteAlarm === 'function') {
+      await storage.deleteAlarm();
+    }
+    return;
+  }
+
+  const nextDueAt = Math.max(Date.now(), Math.min(...nextDueTimes));
+  if (typeof storage.setAlarm === 'function') {
+    await storage.setAlarm(nextDueAt);
+  }
+}
+
+async function deliverDueTelegramReminders(session, env, fetchImpl) {
+  const reminders = compactTelegramReminders(Array.isArray(session?.reminders) ? session.reminders : []);
+  if (reminders.length === 0) {
+    await scheduleTelegramReminderAlarm(session);
+    return [];
+  }
+
+  const now = Date.now();
+  const dueReminders = reminders.filter((reminder) => reminder.dueAt <= now);
+  if (dueReminders.length === 0) {
+    await scheduleTelegramReminderAlarm(session);
+    return [];
+  }
+
+  const chatId = session?.chatId ?? null;
+  if (chatId === null || chatId === undefined) {
+    session.reminders = reminders;
+    await saveTelegramSession(session.storage, session);
+    await scheduleTelegramReminderAlarm(session);
+    return [];
+  }
+
+  let remaining = reminders.slice();
+  // ponytail: per-reminder send+save keeps loss small; exact-once delivery needs receipts or a queue.
+  for (const reminder of dueReminders) {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramReminderFiredText(reminder), {
+      reply_markup: buildTelegramReplyMarkup(),
+    });
+    remaining = remaining.filter((item) => item.id !== reminder.id);
+    session.reminders = remaining;
+    await saveTelegramSession(session.storage, session);
+  }
+
+  await scheduleTelegramReminderAlarm(session);
+  return dueReminders;
+}
+
+async function handleTelegramWatchCommand({ commandText, session, env, fetchImpl, chatId, replyMarkup }) {
+  if (!session) {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramWatchUnavailableText(), replyMarkup);
+    return true;
+  }
+
+  session.chatId = chatId;
+  const watches = compactTelegramWatches(Array.isArray(session.watches) ? session.watches : []);
+  const argsText = normalizeTelegramWatchText(getTelegramCommandArgs(commandText));
+
+  if (!argsText) {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramWatchListText(watches), replyMarkup);
+    return true;
+  }
+
+  const [actionToken, ...restTokens] = argsText.split(/\s+/);
+  const action = actionToken.toLowerCase();
+  const valueText = normalizeTelegramWatchText(restTokens.join(' '));
+
+  if (action === 'list' || action === 'ls' || action === 'show' || action === 'help') {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramWatchListText(watches), replyMarkup);
+    return true;
+  }
+
+  if (action === 'clear' || action === 'empty') {
+    session.watches = [];
+    await saveTelegramSession(session.storage, session);
+    await scheduleTelegramReminderAlarm(session);
+    await sendTelegramMessage(env, fetchImpl, chatId, '网页监控已清空。', replyMarkup);
+    return true;
+  }
+
+  if (action === 'del' || action === 'delete' || action === 'remove' || action === 'rm') {
+    if (!valueText) {
+      await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramWatchMissingText(), replyMarkup);
+      return true;
+    }
+
+    const index = resolveTelegramWatchIndex(watches, valueText);
+    if (index === -1) {
+      await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramWatchNotFoundText(), replyMarkup);
+      return true;
+    }
+
+    const [removed] = watches.splice(index, 1);
+    session.watches = watches;
+    await saveTelegramSession(session.storage, session);
+    await scheduleTelegramReminderAlarm(session);
+    await sendTelegramMessage(env, fetchImpl, chatId, `已删除网页监控：${buildTelegramWatchDisplayName(removed)}`, replyMarkup);
+    return true;
+  }
+
+  const addSpec = action === 'add' || action === 'new' || action === 'create'
+    ? parseTelegramWatchAddSpec(valueText || restTokens.join(' '))
+    : parseTelegramWatchAddSpec(argsText);
+
+  if (!addSpec) {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramWatchMissingText(), replyMarkup);
+    return true;
+  }
+
+  if (watches.some((watch) => watch.url === addSpec.url)) {
+    await sendTelegramMessage(env, fetchImpl, chatId, '该网页已在监控中。', replyMarkup);
+    return true;
+  }
+
+  const watch = createTelegramWatch(addSpec.url, addSpec.label);
+  const page = await scrapeWebPage(fetchImpl, watch.url).catch(() => null);
+  if (page) {
+    const now = Date.now();
+    watch.title = normalizeTelegramWatchText(page.title) || watch.label || watch.title || new URL(watch.url).hostname;
+    watch.contentHash = await hashTelegramWatchContent(page);
+    watch.lastCheckedAt = now;
+    watch.nextCheckAt = now + TELEGRAM_WATCH_POLL_INTERVAL_MS;
+  } else {
+    watch.title = watch.label || (() => {
+      try {
+        return new URL(watch.url).hostname;
+      } catch {
+        return watch.url;
+      }
+    })();
+    watch.nextCheckAt = Date.now() + TELEGRAM_WATCH_POLL_INTERVAL_MS;
+  }
+
+  session.watches = [...watches, watch];
+  await saveTelegramSession(session.storage, session);
+  await scheduleTelegramReminderAlarm(session);
+  await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramWatchAddedText(watch, Boolean(page)), replyMarkup);
+  return true;
+}
+
+async function handleTelegramModeCommand({ commandText, session, env, fetchImpl, chatId, replyMarkup }) {
+  if (!session) {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramModeUnavailableText(), replyMarkup);
+    return true;
+  }
+
+  const currentMode = normalizeTelegramMode(session.mode) || 'normal';
+  const argsText = normalizeTelegramMemoryText(getTelegramCommandArgs(commandText));
+  const [actionToken = '', ...restTokens] = argsText.split(/\s+/);
+  const action = actionToken.toLowerCase();
+  const nextMode = normalizeTelegramMode(actionToken) || normalizeTelegramMode(restTokens.join(' '));
+
+  if (!argsText || action === 'help' || action === 'list' || action === 'show') {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramModeListText(currentMode), replyMarkup);
+    return true;
+  }
+
+  if (!nextMode) {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramModeListText(currentMode), replyMarkup);
+    return true;
+  }
+
+  session.mode = nextMode;
+  await saveTelegramSession(session.storage, session);
+  await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramModeChangedText(nextMode), replyMarkup);
+  return true;
+}
+
+async function handleTelegramSummaryCommand({ commandText, session, env, fetchImpl, chatId, replyMarkup }) {
+  if (!session) {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramSummaryUnavailableText(), replyMarkup);
+    return true;
+  }
+
+  const argsText = normalizeTelegramSummaryText(getTelegramCommandArgs(commandText));
+  const [actionToken = ''] = argsText.split(/\s+/);
+  const action = normalizeTelegramSummaryText(actionToken).toLowerCase();
+
+  if (action === 'compact') {
+    session.memories = compactTelegramMemories(Array.isArray(session.memories) ? session.memories : []);
+    await saveTelegramSession(session.storage, session);
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramSummaryCardText(session), replyMarkup);
+    return true;
+  }
+
+  if (action === 'help' || action === 'show' || action === 'list' || action === 'refresh') {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramSummaryCardText(session), replyMarkup);
+    return true;
+  }
+
+  if (!argsText) {
+    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramSummaryCardText(session), replyMarkup);
+    return true;
+  }
+
+  if (action === 'clear' || action === 'reset' || action === 'empty') {
+    await sendTelegramMessage(env, fetchImpl, chatId, '摘要是动态生成的，不需要单独清空。', replyMarkup);
+    return true;
+  }
+
+  await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramSummaryCardText(session), replyMarkup);
+  return true;
+}
+
+async function deliverDueTelegramWatches(session, env, fetchImpl) {
+  const watches = compactTelegramWatches(Array.isArray(session?.watches) ? session.watches : []);
+  if (watches.length === 0) {
+    await scheduleTelegramReminderAlarm(session);
+    return [];
+  }
+
+  const now = Date.now();
+  const dueWatches = watches.filter((watch) => watch.nextCheckAt <= now);
+  if (dueWatches.length === 0) {
+    await scheduleTelegramReminderAlarm(session);
+    return [];
+  }
+
+  const chatId = session?.chatId ?? null;
+  let remaining = watches.slice();
+
+  for (const watch of dueWatches) {
+    const index = remaining.findIndex((item) => item.id === watch.id);
+    if (index === -1) continue;
+
+    const current = remaining[index];
+    const updated = {
+      ...current,
+      nextCheckAt: now + TELEGRAM_WATCH_POLL_INTERVAL_MS,
+      lastCheckedAt: now,
+    };
+
+    const page = await scrapeWebPage(fetchImpl, current.url).catch(() => null);
+    if (page) {
+      updated.title = normalizeTelegramWatchText(page.title) || updated.title || current.label || current.title;
+      const contentHash = await hashTelegramWatchContent(page);
+      const changed = Boolean(updated.contentHash) && contentHash && contentHash !== updated.contentHash;
+      if (contentHash) {
+        updated.contentHash = contentHash;
+      }
+
+      if (changed && chatId !== null && chatId !== undefined) {
+        try {
+          await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramWatchChangedText(updated, page), {
+            reply_markup: buildTelegramReplyMarkup(),
+          });
+          updated.lastNotifiedAt = now;
+        } catch (error) {
+          console.error('Telegram watch notification failed', error);
+        }
+      }
+    }
+
+    remaining[index] = updated;
+    session.watches = remaining;
+    await saveTelegramSession(session.storage, session);
+  }
+
+  await scheduleTelegramReminderAlarm(session);
+  return dueWatches;
+}
+
+function buildTelegramConversationMessages(messages, memories = [], webContext = '', sessionContext = {}) {
   const conversationMessages = Array.isArray(messages) ? messages : [];
   const contextMessages = [];
+  // 先注入 claw 的固定人格和项目偏好，再叠加会话记忆与本轮网页上下文。
+  if (CLAW_SYSTEM_MESSAGE) {
+    contextMessages.push(CLAW_SYSTEM_MESSAGE);
+  }
+  const modeContext = buildTelegramModeContextText(sessionContext?.mode);
+  if (modeContext) {
+    contextMessages.push({ role: 'system', content: modeContext });
+  }
+
+  const summaryContext = buildTelegramSummaryContextText(sessionContext);
+  if (summaryContext) {
+    contextMessages.push({ role: 'system', content: summaryContext });
+  }
   const memoryContext = buildTelegramMemoryContextText(memories);
   if (memoryContext) {
     contextMessages.push({ role: 'system', content: memoryContext });
-  }
-
-  const soulPrompt = String(SOUL_PROMPT || '').trim();
-  if (soulPrompt) {
-    contextMessages.push({
-      role: 'system',
-      content: `项目人格设定（来自 soul.md）：\n${soulPrompt}`,
-    });
   }
 
   const webContextText = typeof webContext === 'string' ? webContext.trim() : '';
@@ -524,6 +1694,23 @@ function normalizeTelegramMemoryText(text) {
   return String(text || '').trim().replace(/\s+/g, ' ');
 }
 
+function normalizeTelegramDisplayText(text) {
+  return String(text || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/^\s*>\s?/gm, '')
+    .replace(/^\s*[*+-]\s+/gm, '- ')
+    .replace(/\*\*(.+?)\*\*/g, '$1')
+    .replace(/__(.+?)__/g, '$1')
+    .replace(/(^|[\s([{])\*(.+?)\*(?=$|[\s)\]},.!?:;])/g, '$1$2')
+    .replace(/(^|[\s([{])_(.+?)_(?=$|[\s)\]},.!?:;])/g, '$1$2')
+    .replace(/~~(.+?)~~/g, '$1')
+    .replace(/`{1,3}(.+?)`{1,3}/g, '$1')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function trimTelegramMemories(memories, maxItems = 20) {
   if (!Array.isArray(memories) || memories.length <= maxItems) {
     return Array.isArray(memories) ? memories : [];
@@ -710,8 +1897,13 @@ function trimTelegramHistory(history, maxItems = 12) {
 
 function createTelegramSessionState() {
   return {
+    chatId: null,
     history: [],
     memories: [],
+    todos: [],
+    reminders: [],
+    watches: [],
+    mode: 'normal',
     lastPrompt: '',
     lastReply: '',
   };
@@ -722,8 +1914,13 @@ async function loadTelegramSession(storage) {
   const session = await storage.get('telegram-session');
   if (!session || typeof session !== 'object') return createTelegramSessionState();
   return {
+    chatId: typeof session.chatId === 'number' || typeof session.chatId === 'string' ? session.chatId : null,
     history: Array.isArray(session.history) ? session.history : [],
     memories: compactTelegramMemories(Array.isArray(session.memories) ? session.memories : []),
+    todos: compactTelegramTodos(Array.isArray(session.todos) ? session.todos : []),
+    reminders: compactTelegramReminders(Array.isArray(session.reminders) ? session.reminders : []),
+    watches: compactTelegramWatches(Array.isArray(session.watches) ? session.watches : []),
+    mode: normalizeTelegramMode(session.mode) || 'normal',
     lastPrompt: typeof session.lastPrompt === 'string' ? session.lastPrompt : '',
     lastReply: typeof session.lastReply === 'string' ? session.lastReply : '',
   };
@@ -732,15 +1929,25 @@ async function loadTelegramSession(storage) {
 async function saveTelegramSession(storage, session) {
   if (!storage) return;
   const payload = {
+    chatId: typeof session?.chatId === 'number' || typeof session?.chatId === 'string' ? session.chatId : null,
     history: trimTelegramHistory(Array.isArray(session?.history) ? session.history : []),
     memories: compactTelegramMemories(Array.isArray(session?.memories) ? session.memories : []),
+    todos: compactTelegramTodos(Array.isArray(session?.todos) ? session.todos : []),
+    reminders: compactTelegramReminders(Array.isArray(session?.reminders) ? session.reminders : []),
+    watches: compactTelegramWatches(Array.isArray(session?.watches) ? session.watches : []),
+    mode: normalizeTelegramMode(session?.mode) || 'normal',
     lastPrompt: typeof session?.lastPrompt === 'string' ? session.lastPrompt : '',
     lastReply: typeof session?.lastReply === 'string' ? session.lastReply : '',
   };
 
   if (session && typeof session === 'object') {
+    session.chatId = payload.chatId;
     session.history = payload.history;
     session.memories = payload.memories;
+    session.todos = payload.todos;
+    session.reminders = payload.reminders;
+    session.watches = payload.watches;
+    session.mode = payload.mode;
     session.lastPrompt = payload.lastPrompt;
     session.lastReply = payload.lastReply;
   }
@@ -780,7 +1987,7 @@ async function callTelegramBotApi(env, fetchImpl, method, payload) {
 async function sendTelegramMessage(env, fetchImpl, chatId, text, extra = {}) {
   return callTelegramBotApi(env, fetchImpl, 'sendMessage', {
     chat_id: chatId,
-    text: normalizeTelegramOutput(text),
+    text: normalizeTelegramDisplayText(text),
     ...extra,
   });
 }
@@ -789,7 +1996,7 @@ async function editTelegramMessage(env, fetchImpl, chatId, messageId, text, extr
   return callTelegramBotApi(env, fetchImpl, 'editMessageText', {
     chat_id: chatId,
     message_id: messageId,
-    text: normalizeTelegramOutput(text),
+    text: normalizeTelegramDisplayText(text),
     ...extra,
   });
 }
@@ -982,7 +2189,14 @@ async function generateConversationReply(messages, env, fetchImpl) {
 }
 
 async function generateReply(prompt, env, fetchImpl) {
-  return generateConversationReply([{ role: 'user', content: prompt }], env, fetchImpl);
+  const baseUrl = getOpenAIBaseUrl(env);
+  if (!baseUrl) {
+    return buildLocalReply(prompt);
+  }
+
+  const webContext = await prepareWebContext(prompt, fetchImpl);
+  const messages = buildTelegramConversationMessages([{ role: 'user', content: prompt }], [], webContext);
+  return generateConversationReply(messages, env, fetchImpl);
 }
 
 async function streamConversationReply(messages, env, fetchImpl, onText) {
@@ -1075,12 +2289,12 @@ function getTelegramMessage(update) {
   };
 }
 
-async function streamTelegramReply(env, fetchImpl, chatId, messageId, messages, fallbackPrompt, extra = {}, memories = [], webContext = '') {
+async function streamTelegramReply(env, fetchImpl, chatId, messageId, messages, fallbackPrompt, extra = {}, memories = [], webContext = '', sessionContext = {}) {
   // 这一层把 OpenAI 风格的 SSE 增量翻译成 Telegram 的消息编辑。
   // 有 messageId 就原地更新同一条消息；没有 messageId 就退回成一次性 sendMessage。
   let lastRendered = '';
 
-  const conversationMessages = buildTelegramConversationMessages(messages, memories, webContext);
+  const conversationMessages = buildTelegramConversationMessages(messages, memories, webContext, sessionContext);
   const finalText = await streamConversationReply(conversationMessages, env, fetchImpl, async (rendered) => {
     lastRendered = rendered;
     if (messageId) {
@@ -1108,34 +2322,25 @@ async function generateAndStreamTelegramReply({ update, session, env, fetchImpl 
     return json({ ok: true, ignored: true });
   }
 
+  session.chatId = chatId;
   const commandText = getTelegramText(update?.message || update?.edited_message || update?.channel_post);
   const command = parseTelegramCommand(commandText);
   const replyMarkup = { reply_markup: buildTelegramReplyMarkup() };
 
-  if (command === 'start' || command === 'help') {
-    // 帮助面板只负责引导用户，不改变会话内容。
-    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramHelpText(), {
-      reply_markup: buildTelegramReplyMarkup(),
+  if (command) {
+    const handled = await handleTelegramSlashCommand({
+      command,
+      commandText,
+      session,
+      env,
+      fetchImpl,
+      chatId,
+      replyMarkup,
     });
-    return json({ ok: true, sent: true, command });
-  }
 
-  if (command === 'model') {
-    // /model 只读展示当前配置，方便用户确认现在走的是本地还是上游模型。
-    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramModelText(env), {
-      reply_markup: buildTelegramReplyMarkup(),
-    });
-    return json({ ok: true, sent: true, command });
-  }
-
-  if (command === 'reset') {
-    // /reset 只清短期会话历史和最后一轮状态，不碰长期记忆。
-    // 这样用户可以把“会话重置”和“长期记忆清理”分开控制。
-    await resetTelegramConversation(session);
-    await sendTelegramMessage(env, fetchImpl, chatId, buildTelegramResetText(), {
-      reply_markup: buildTelegramReplyMarkup(),
-    });
-    return json({ ok: true, sent: true, command });
+    if (handled) {
+      return json({ ok: true, sent: true, command });
+    }
   }
 
   if (update?.callback_query) {
@@ -1222,11 +2427,19 @@ async function generateAndStreamTelegramReply({ update, session, env, fetchImpl 
         },
         session.memories,
         webContext,
+        session,
       );
 
       session.history = trimTelegramHistory([...history, { role: 'assistant', content: replyText }]);
       session.lastReply = replyText;
       await saveTelegramSession(session.storage, session);
+      await sendTelegramProactiveFollowUp({
+        env,
+        fetchImpl,
+        chatId,
+        prompt: session.lastPrompt,
+        replyText,
+      });
       return json({ ok: true, sent: true, callback: callbackData, retried: true });
     }
   }
@@ -1266,12 +2479,20 @@ async function generateAndStreamTelegramReply({ update, session, env, fetchImpl 
     },
     session.memories,
     webContext,
+    session,
   );
 
   session.history.push({ role: 'assistant', content: replyText });
   session.history = trimTelegramHistory(session.history);
   session.lastReply = replyText;
   await saveTelegramSession(session.storage, session);
+  await sendTelegramProactiveFollowUp({
+    env,
+    fetchImpl,
+    chatId,
+    prompt,
+    replyText,
+  });
 
   return json({ ok: true, sent: true });
 }
@@ -1329,9 +2550,29 @@ async function handleTelegramWebhook(request, env, ctx, fetchImpl) {
     return json({ ok: true, ignored: true });
   }
 
+  const command = parseTelegramCommand(text);
+  if (command) {
+    await handleTelegramSlashCommand({
+      command,
+      commandText: text,
+      env,
+      fetchImpl,
+      chatId,
+      replyMarkup: { reply_markup: buildTelegramReplyMarkup() },
+    });
+    return json({ ok: true, sent: true, command });
+  }
+
   // 没有绑定 DO 时，保留一个同步回退，方便本地跑通和最小部署。
   const reply = await generateReply(text, env, fetchImpl);
   await sendTelegramMessage(env, fetchImpl, chatId, reply);
+  await sendTelegramProactiveFollowUp({
+    env,
+    fetchImpl,
+    chatId,
+    prompt: text,
+    replyText: reply,
+  });
 
   return json({ ok: true, sent: true });
 }
@@ -1362,6 +2603,14 @@ export class TelegramSession {
     });
     delete session.storage;
     return response;
+  }
+
+  async alarm() {
+    const session = await loadTelegramSession(this.state.storage);
+    session.storage = this.state.storage;
+    await deliverDueTelegramReminders(session, this.env, this.fetchImpl);
+    await deliverDueTelegramWatches(session, this.env, this.fetchImpl);
+    delete session.storage;
   }
 }
 
