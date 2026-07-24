@@ -110,11 +110,13 @@ test('returns a streaming OpenAI-compatible chat completion response', async () 
 
 test('returns upstream OpenAI-compatible chat completions with web context injected', async () => {
   const upstreamBodies = [];
+  const upstreamAuthHeaders = [];
 
   const response = await handleRequest(
     new Request('https://example.com/v1/chat/completions', {
       method: 'POST',
       headers: {
+        authorization: 'Bearer client-secret',
         'content-type': 'application/json',
       },
       body: JSON.stringify({
@@ -126,7 +128,9 @@ test('returns upstream OpenAI-compatible chat completions with web context injec
       }),
     }),
     {
+      CLAW_API_KEY: 'client-secret',
       OPENAI_BASE_URL: 'https://upstream.example/v1',
+      OPENAI_API_KEY: 'upstream-secret',
     },
     {},
     async (input, init) => {
@@ -156,6 +160,7 @@ test('returns upstream OpenAI-compatible chat completions with web context injec
 
       if (url.startsWith('https://upstream.example/')) {
         upstreamBodies.push(JSON.parse(init.body));
+        upstreamAuthHeaders.push(new Headers(init.headers).get('authorization'));
         return new Response(
           [
             'data: {"choices":[{"delta":{"role":"assistant"}}]}',
@@ -181,6 +186,7 @@ test('returns upstream OpenAI-compatible chat completions with web context injec
 
   assert.equal(response.status, 200);
   assert.equal(upstreamBodies.length, 1);
+  assert.deepEqual(upstreamAuthHeaders, ['Bearer upstream-secret']);
   assert.equal(upstreamBodies[0].messages[0].role, 'system');
   assert.match(upstreamBodies[0].messages[0].content, /幽默风趣的男高中生/);
   assert.match(upstreamBodies[0].messages[0].content, /主要入口是 Telegram/);
@@ -190,6 +196,65 @@ test('returns upstream OpenAI-compatible chat completions with web context injec
   assert.match(upstreamBodies[0].messages[1].content, /Example Docs/);
   assert.equal(upstreamBodies[0].messages.at(-1).role, 'user');
   assert.match(upstreamBodies[0].messages.at(-1).content, /搜索 Cloudflare Workers 文档/);
+});
+
+test('requires a client API key before proxying upstream OpenAI-compatible requests', async () => {
+  const response = await handleRequest(
+    new Request('https://example.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'demo-model',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    }),
+    {
+      CLAW_API_KEY: 'client-secret',
+      OPENAI_BASE_URL: 'https://upstream.example/v1',
+    },
+    {},
+    async () => {
+      throw new Error('fetch should not be called');
+    },
+  );
+
+  assert.equal(response.status, 401);
+  assert.deepEqual(await response.json(), {
+    error: {
+      message: 'unauthorized',
+    },
+  });
+});
+
+test('fails closed when upstream OpenAI-compatible requests have no client API key configured', async () => {
+  const response = await handleRequest(
+    new Request('https://example.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'demo-model',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    }),
+    {
+      OPENAI_BASE_URL: 'https://upstream.example/v1',
+    },
+    {},
+    async () => {
+      throw new Error('fetch should not be called');
+    },
+  );
+
+  assert.equal(response.status, 500);
+  assert.deepEqual(await response.json(), {
+    error: {
+      message: 'CLAW_API_KEY is required',
+    },
+  });
 });
 
 test('returns a local OpenAI-compatible model list', async () => {
@@ -202,6 +267,36 @@ test('returns a local OpenAI-compatible model list', async () => {
   const payload = await response.json();
   assert.equal(payload.object, 'list');
   assert.equal(payload.data[0].id, 'claw-mini');
+});
+
+test('rejects telegram webhook requests when the secret token is not configured', async () => {
+  const response = await handleRequest(
+    new Request('https://example.com/telegram/webhook', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        message: {
+          chat: { id: 1 },
+          text: 'ping',
+        },
+      }),
+    }),
+    {
+      TELEGRAM_BOT_TOKEN: 'bot-token',
+    },
+    {},
+    async () => {
+      throw new Error('fetch should not be called');
+    },
+  );
+
+  assert.equal(response.status, 500);
+  assert.deepEqual(await response.json(), {
+    ok: false,
+    error: 'TELEGRAM_WEBHOOK_SECRET is required',
+  });
 });
 
 test('rejects telegram webhook requests with the wrong secret token', async () => {
@@ -933,6 +1028,95 @@ test('TelegramSession sends watch change notifications on alarm', async () => {
   assert.equal(stored.watches.length, 1);
   assert.notEqual(stored.watches[0].contentHash, '');
   assert.equal(await storage.getAlarm() > Date.now(), true);
+});
+
+test('TelegramSession alarm keeps processing when a reminder notification fails', async () => {
+  const calls = [];
+  const now = Date.now();
+  const storage = createStorage({
+    'telegram-session': {
+      chatId: 42,
+      history: [],
+      memories: [],
+      todos: [],
+      reminders: [
+        {
+          id: 'reminder-1',
+          text: '喝水',
+          dueAt: now - 1000,
+          createdAt: now - 2000,
+        },
+      ],
+      watches: [
+        {
+          id: 'watch-1',
+          url: 'https://example.com/watch',
+          label: 'Watched',
+          title: 'Old',
+          contentHash: 'old-hash',
+          nextCheckAt: now - 1000,
+          createdAt: now - 2000,
+          lastCheckedAt: now - 2000,
+          lastNotifiedAt: 0,
+        },
+      ],
+      mode: 'normal',
+      lastPrompt: '',
+      lastReply: '',
+    },
+  });
+  const session = new TelegramSession(
+    { storage },
+    {
+      TELEGRAM_BOT_TOKEN: 'bot-token',
+    },
+    async (input, init) => {
+      const url = String(input);
+
+      if (url === 'https://example.com/watch') {
+        return new Response('<html><head><title>Watched</title></head><body><p>new content</p></body></html>', {
+          headers: {
+            'content-type': 'text/html; charset=utf-8',
+          },
+        });
+      }
+
+      if (url.endsWith('/sendMessage')) {
+        const body = JSON.parse(init.body);
+        calls.push(body);
+        if (body.text.startsWith('⏰')) {
+          return new Response(JSON.stringify({ ok: false }), { status: 500 });
+        }
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 12 } }), {
+          headers: {
+            'content-type': 'application/json',
+          },
+        });
+      }
+
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+  );
+
+  const originalConsoleError = console.error;
+  const errors = [];
+  console.error = (...args) => {
+    errors.push(args);
+  };
+  try {
+    await session.alarm();
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  const stored = await storage.get('telegram-session');
+  assert.equal(errors.length, 1);
+  assert.equal(stored.reminders.length, 1);
+  assert.equal(stored.watches.length, 1);
+  assert.equal(stored.watches[0].title, 'Watched');
+  assert.notEqual(stored.watches[0].contentHash, 'old-hash');
+  assert(calls.some((body) => body.text.startsWith('网页已变化：Watched')));
+  assert.notEqual(await storage.getAlarm(), null);
 });
 
 test('TelegramSession manages /mode and shows /summary cards', async () => {
@@ -1923,10 +2107,8 @@ test('TelegramSession streams upstream deltas into message edits', async () => {
   assert.equal(response.status, 200);
 
   const edits = calls.filter((call) => String(call.input).endsWith('/editMessageText'));
-  assert(edits.length >= 3);
-  assert.equal(JSON.parse(edits[0].init.body).text, 'Hel');
-  assert.equal(JSON.parse(edits[1].init.body).text, 'Hello');
-  assert.equal(JSON.parse(edits.at(-1).init.body).text, 'Hello world');
+  assert.equal(edits.length, 1);
+  assert.equal(JSON.parse(edits[0].init.body).text, 'Hello world');
 
   const stored = await storage.get('telegram-session');
   assert.equal(stored.lastReply, 'Hello world');

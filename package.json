@@ -5,10 +5,13 @@
   "scripts": {
     "generate:prompts": "node scripts/generate-claw-prompts.mjs",
     "predev": "npm run generate:prompts",
-    "dev": "npx wrangler dev",
+    "dev": "wrangler dev",
     "predeploy": "npm run generate:prompts",
-    "deploy": "npx wrangler deploy",
+    "deploy": "wrangler deploy",
     "pretest": "npm run generate:prompts",
     "test": "node --test"
+  },
+  "devDependencies": {
+    "wrangler": "4.114.0"
   }
 }

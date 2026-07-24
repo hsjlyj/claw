@@ -124,7 +124,7 @@ cd claw
 npm install
 ```
 
-当前 `package.json` 只有脚本，没有额外运行时依赖，但执行一次 `npm install` 仍然是推荐的，方便后续生成锁文件或扩展依赖。
+当前没有额外运行时依赖，`wrangler` 作为开发依赖固定在 lockfile 里。
 
 ### 3. 配置 Cloudflare 和 Telegram
 
@@ -140,6 +140,7 @@ npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
 如果你要把请求转发到上游 OpenAI-compatible 服务，再加：
 
 ```bash
+npx wrangler secret put CLAW_API_KEY
 npx wrangler secret put OPENAI_API_KEY
 ```
 
@@ -198,6 +199,7 @@ curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | 是 | Telegram Bot API 访问令牌 |
 | `TELEGRAM_WEBHOOK_SECRET` | 是 | webhook 校验用 secret token |
+| `CLAW_API_KEY` | `/v1` 上游模式必填 | `/v1/*` OpenAI-compatible 接口的客户端访问密钥 |
 | `OPENAI_BASE_URL` | 否 | 上游 OpenAI-compatible 服务地址 |
 | `OPENAI_API_KEY` | 否 | 上游接口鉴权用 Bearer token |
 | `CLAW_MODEL` | 否 | 本项目优先使用的模型名 |
@@ -251,6 +253,7 @@ curl http://127.0.0.1:8787/v1/models
 
 ```bash
 curl http://127.0.0.1:8787/v1/chat/completions \
+  -H "authorization: Bearer ${CLAW_API_KEY}" \
   -H 'content-type: application/json' \
   -d '{
     "model": "claw-mini",
@@ -266,6 +269,8 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 如果配置了 `OPENAI_BASE_URL`：
 
 - 请求会转发到上游 OpenAI-compatible 服务
+- `/v1/*` 会要求客户端使用 `Authorization: Bearer ${CLAW_API_KEY}`
+- 上游只接收 `OPENAI_API_KEY`，不会收到客户端的 `CLAW_API_KEY`
 - 会在用户消息前插入隐藏的系统上下文
 - 上下文里会带上搜索结果和抓取结果
 - 当前实现里，Telegram 长期记忆主要服务 Telegram 会话，不会自动注入到上游转发的 OpenAI-compatible 请求里

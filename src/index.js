@@ -17,6 +17,7 @@ const TELEGRAM_MEMORY_COMPACT_THRESHOLD = 8;
 const TELEGRAM_MEMORY_SUMMARY_LIMIT = 240;
 // ponytail: one fixed polling interval keeps watch alarms simple; per-watch cadence can come later.
 const TELEGRAM_WATCH_POLL_INTERVAL_MS = 30 * 60 * 1000;
+const TELEGRAM_STREAM_EDIT_MIN_CHARS = 80;
 const WEB_SEARCH_RESULT_LIMIT = 3;
 const WEB_SCRAPE_LIMIT = 2;
 const WEB_CONTEXT_LIMIT = 1800;
@@ -55,6 +56,59 @@ function getConfiguredModel(env) {
 
 function getOpenAIBaseUrl(env) {
   return env?.OPENAI_BASE_URL ? String(env.OPENAI_BASE_URL) : '';
+}
+
+function getSecretText(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+async function digestSecretText(value) {
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(value || ''))));
+}
+
+async function timingSafeEqualText(provided, expected) {
+  const [providedHash, expectedHash] = await Promise.all([
+    digestSecretText(provided),
+    digestSecretText(expected),
+  ]);
+  let diff = providedHash.length ^ expectedHash.length;
+  const length = Math.max(providedHash.length, expectedHash.length);
+
+  for (let index = 0; index < length; index += 1) {
+    diff |= (providedHash[index] ?? 0) ^ (expectedHash[index] ?? 0);
+  }
+
+  return diff === 0;
+}
+
+function getBearerToken(request) {
+  const match = String(request.headers.get('authorization') || '').match(/^Bearer\s+(.+)$/iu);
+  return match ? match[1].trim() : '';
+}
+
+async function authorizeOpenAIRequest(request, env) {
+  const clientKey = getSecretText(env?.CLAW_API_KEY);
+
+  if (!clientKey) {
+    if (getOpenAIBaseUrl(env) || getSecretText(env?.OPENAI_API_KEY)) {
+      return json({ error: { message: 'CLAW_API_KEY is required' } }, { status: 500 });
+    }
+    return null;
+  }
+
+  if (!(await timingSafeEqualText(getBearerToken(request), clientKey))) {
+    return json(
+      { error: { message: 'unauthorized' } },
+      {
+        status: 401,
+        headers: {
+          'www-authenticate': 'Bearer',
+        },
+      },
+    );
+  }
+
+  return null;
 }
 
 function resolveUpstreamUrl(baseUrl, requestUrl) {
@@ -113,26 +167,17 @@ function parseTelegramCommand(text) {
 }
 
 // Telegram 命令先集中登记，再由 help 面板和路由层一起读取。
-// 公开命令会显示在 /help 里，隐藏命令只保留路由入口，不对用户展开。
 const TELEGRAM_COMMAND_SPECS = Object.freeze([
-  { command: 'start', description: '显示此帮助', kind: 'help' },
-  { command: 'help', description: '显示此帮助', kind: 'help' },
-  { command: 'model', description: '查看当前模型', kind: 'model' },
-  { command: 'reset', description: '清空当前会话', kind: 'reset' },
-  { command: 'todo', description: '管理待办事项', kind: 'pending' },
-  { command: 'remind', description: '管理提醒任务', kind: 'pending' },
-  { command: 'watch', description: '管理网页监控', kind: 'pending' },
-  { command: 'mode', description: '查看或切换运行模式', kind: 'pending' },
-  { command: 'summary', description: '查看或压缩近期摘要', kind: 'pending' },
-  { command: 'remember', description: '记住一条长期记忆', kind: 'hidden' },
-  { command: 'memories', description: '查看长期记忆列表', kind: 'hidden' },
-  { command: 'forget', description: '删除长期记忆', kind: 'hidden' },
+  { command: 'start', description: '显示此帮助' },
+  { command: 'help', description: '显示此帮助' },
+  { command: 'model', description: '查看当前模型' },
+  { command: 'reset', description: '清空当前会话' },
+  { command: 'todo', description: '管理待办事项' },
+  { command: 'remind', description: '管理提醒任务' },
+  { command: 'watch', description: '管理网页监控' },
+  { command: 'mode', description: '查看或切换运行模式' },
+  { command: 'summary', description: '查看或压缩近期摘要' },
 ]);
-const TELEGRAM_PUBLIC_COMMAND_SPECS = TELEGRAM_COMMAND_SPECS.filter((spec) => spec.kind !== 'hidden');
-
-function buildTelegramPendingCommandText(command) {
-  return `/${command} 命令已接入路由，功能还在接入中。输入 /help 查看可用命令。`;
-}
 
 function buildTelegramUnsupportedCommandText(command) {
   return `暂不支持 /${command}。输入 /help 查看可用命令。`;
@@ -521,7 +566,7 @@ function buildTelegramHelpText() {
     '命令：',
   ];
 
-  for (const spec of TELEGRAM_PUBLIC_COMMAND_SPECS) {
+  for (const spec of TELEGRAM_COMMAND_SPECS) {
     lines.push(`/${spec.command} - ${spec.description}`);
   }
 
@@ -623,37 +668,6 @@ async function sendTelegramProactiveFollowUp({ env, fetchImpl, chatId, prompt, r
     console.error('Telegram proactive follow-up failed', error);
     return false;
   }
-}
-
-function buildTelegramMemorySavedText(memory) {
-  return `已记住：${memory.text}`;
-}
-
-function buildTelegramMemoryMissingText() {
-  return '请在命令后面补充要记住的内容。';
-}
-
-function buildTelegramMemoryForgotText(memory) {
-  return `已删除记忆：${memory.text}`;
-}
-
-function buildTelegramForgetMissingText() {
-  return '请在命令后面补充要删除的记忆编号或关键词。';
-}
-
-function buildTelegramMemoryNotFoundText() {
-  return '没有找到要删除的记忆。';
-}
-
-function buildTelegramMemoryListText(memories = []) {
-  if (!Array.isArray(memories) || memories.length === 0) {
-    return '当前没有长期记忆。';
-  }
-
-  return [
-    '当前长期记忆：',
-    ...memories.map((memory, index) => `${index + 1}. ${memory.text}`),
-  ].join('\n');
 }
 
 function buildTelegramMemoryContextText(memories = []) {
@@ -1386,6 +1400,16 @@ async function deliverDueTelegramWatches(session, env, fetchImpl) {
   return dueWatches;
 }
 
+async function runTelegramAlarmTask(name, task) {
+  try {
+    await task();
+    return true;
+  } catch (error) {
+    console.error(`Telegram alarm ${name} failed`, error);
+    return false;
+  }
+}
+
 function buildTelegramConversationMessages(messages, memories = [], webContext = '', sessionContext = {}) {
   const conversationMessages = Array.isArray(messages) ? messages : [];
   const contextMessages = [];
@@ -1711,14 +1735,6 @@ function normalizeTelegramDisplayText(text) {
     .trim();
 }
 
-function trimTelegramMemories(memories, maxItems = 20) {
-  if (!Array.isArray(memories) || memories.length <= maxItems) {
-    return Array.isArray(memories) ? memories : [];
-  }
-
-  return memories.slice(memories.length - maxItems);
-}
-
 function createTelegramMemory(text, source = 'manual') {
   return {
     id: crypto.randomUUID(),
@@ -1865,31 +1881,6 @@ function captureAutomaticTelegramMemories(session, prompt) {
   return created;
 }
 
-function addTelegramMemory(session, text, source = 'manual') {
-  const memoryText = normalizeTelegramMemoryText(text);
-  if (!memoryText) return null;
-
-  const memory = createTelegramMemory(memoryText, source);
-  session.memories = compactTelegramMemories([...(Array.isArray(session.memories) ? session.memories : []), memory]);
-  return memory;
-}
-
-function resolveTelegramMemoryIndex(memories, rawTarget) {
-  if (!Array.isArray(memories) || memories.length === 0) return -1;
-
-  const target = normalizeTelegramMemoryText(rawTarget);
-  if (!target) return -1;
-
-  const numeric = Number.parseInt(target, 10);
-  if (Number.isInteger(numeric) && String(numeric) === target) {
-    const index = numeric - 1;
-    return index >= 0 && index < memories.length ? index : -1;
-  }
-
-  const lowerTarget = target.toLowerCase();
-  return memories.findIndex((memory) => memory.text.toLowerCase().includes(lowerTarget));
-}
-
 function trimTelegramHistory(history, maxItems = 12) {
   if (!Array.isArray(history) || history.length <= maxItems) return Array.isArray(history) ? history : [];
   return history.slice(history.length - maxItems);
@@ -2032,6 +2023,10 @@ function splitTextForStreaming(text) {
   return chunks && chunks.length > 0 ? chunks : text ? [String(text)] : [''];
 }
 
+function shouldEditTelegramStream(rendered, lastEdited) {
+  return String(rendered || '').length - String(lastEdited || '').length >= TELEGRAM_STREAM_EDIT_MIN_CHARS;
+}
+
 function buildLocalReply(prompt) {
   // ponytail: local echo fallback; replace with a real provider when OPENAI_BASE_URL is not set.
   return prompt ? `claw: ${prompt}` : 'claw is ready.';
@@ -2142,8 +2137,9 @@ function buildModelsResponse(model) {
 async function proxyOpenAIRequest(request, env, fetchImpl) {
   const upstream = resolveUpstreamUrl(getOpenAIBaseUrl(env), new URL(request.url));
   const headers = new Headers(request.headers);
+  headers.delete('authorization');
 
-  if (env?.OPENAI_API_KEY && !headers.has('authorization')) {
+  if (env?.OPENAI_API_KEY) {
     headers.set('authorization', `Bearer ${env.OPENAI_API_KEY}`);
   }
 
@@ -2293,19 +2289,21 @@ async function streamTelegramReply(env, fetchImpl, chatId, messageId, messages, 
   // 这一层把 OpenAI 风格的 SSE 增量翻译成 Telegram 的消息编辑。
   // 有 messageId 就原地更新同一条消息；没有 messageId 就退回成一次性 sendMessage。
   let lastRendered = '';
+  let lastEdited = '';
 
   const conversationMessages = buildTelegramConversationMessages(messages, memories, webContext, sessionContext);
   const finalText = await streamConversationReply(conversationMessages, env, fetchImpl, async (rendered) => {
     lastRendered = rendered;
-    if (messageId) {
+    if (messageId && shouldEditTelegramStream(rendered, lastEdited)) {
       await editTelegramMessage(env, fetchImpl, chatId, messageId, rendered, extra);
+      lastEdited = rendered;
     }
   });
 
   const replyText = finalText || lastRendered || buildLocalReply(fallbackPrompt);
   if (!messageId) {
     await sendTelegramMessage(env, fetchImpl, chatId, replyText, extra);
-  } else if (replyText !== lastRendered) {
+  } else if (replyText !== lastEdited) {
     await editTelegramMessage(env, fetchImpl, chatId, messageId, replyText, extra);
   }
 
@@ -2500,8 +2498,12 @@ async function generateAndStreamTelegramReply({ update, session, env, fetchImpl 
 async function handleTelegramWebhook(request, env, ctx, fetchImpl) {
   if (request.method !== 'POST') return methodNotAllowed('POST');
 
-  const secret = env?.TELEGRAM_WEBHOOK_SECRET;
-  if (secret && request.headers.get('x-telegram-bot-api-secret-token') !== secret) {
+  const secret = getSecretText(env?.TELEGRAM_WEBHOOK_SECRET);
+  if (!secret) {
+    return json({ ok: false, error: 'TELEGRAM_WEBHOOK_SECRET is required' }, { status: 500 });
+  }
+
+  if (!(await timingSafeEqualText(request.headers.get('x-telegram-bot-api-secret-token') || '', secret))) {
     return json({ ok: false, error: 'invalid secret token' }, { status: 401 });
   }
 
@@ -2608,9 +2610,13 @@ export class TelegramSession {
   async alarm() {
     const session = await loadTelegramSession(this.state.storage);
     session.storage = this.state.storage;
-    await deliverDueTelegramReminders(session, this.env, this.fetchImpl);
-    await deliverDueTelegramWatches(session, this.env, this.fetchImpl);
-    delete session.storage;
+    try {
+      await runTelegramAlarmTask('reminders', () => deliverDueTelegramReminders(session, this.env, this.fetchImpl));
+      await runTelegramAlarmTask('watches', () => deliverDueTelegramWatches(session, this.env, this.fetchImpl));
+      await scheduleTelegramReminderAlarm(session);
+    } finally {
+      delete session.storage;
+    }
   }
 }
 
@@ -2631,8 +2637,9 @@ async function handleChatCompletions(request, env, fetchImpl) {
     const augmentedMessages = buildTelegramConversationMessages(messages, [], webContext);
     const upstream = resolveUpstreamUrl(getOpenAIBaseUrl(env), new URL('/v1/chat/completions', getOpenAIBaseUrl(env)));
     const headers = new Headers(request.headers);
+    headers.delete('authorization');
 
-    if (env?.OPENAI_API_KEY && !headers.has('authorization')) {
+    if (env?.OPENAI_API_KEY) {
       headers.set('authorization', `Bearer ${env.OPENAI_API_KEY}`);
     }
 
@@ -2691,10 +2698,14 @@ async function handleRequest(request, env = {}, ctx = {}, fetchImpl = fetch) {
   }
 
   if (path === '/v1/chat/completions') {
+    const authResponse = await authorizeOpenAIRequest(request, env);
+    if (authResponse) return authResponse;
     return handleChatCompletions(request, env, fetchImpl);
   }
 
   if (path === '/v1/models' || path.startsWith('/v1/models/')) {
+    const authResponse = await authorizeOpenAIRequest(request, env);
+    if (authResponse) return authResponse;
     return handleModels(request, env, fetchImpl);
   }
 
